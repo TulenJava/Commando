@@ -28,6 +28,25 @@ namespace Commando
         private static readonly Dictionary<string, string> _aliases = new(StringComparer.OrdinalIgnoreCase);
         private static readonly HttpClient _http = new();
         private static volatile bool _stopWatch = false;
+        private static volatile bool _ctrlCPressed = false;
+        private static Process? _activeChild;
+        private static AppSettings _settings = new();
+        private static readonly string SettingsDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Commando");
+        private static string SettingsFile => Path.Combine(SettingsDirectory, "settings.json");
+        private static string HistoryFile => Path.Combine(SettingsDirectory, "history.txt");
+
+        private sealed class AppSettings
+        {
+            public string Prompt { get; set; } = "> ";
+            public bool ShowBanner { get; set; } = true;
+            public bool ClearOnStart { get; set; } = true;
+            public string DefaultShell { get; set; } = "cmd"; // cmd | powershell
+            public string PowerShellHost { get; set; } = "auto"; // auto | pwsh | windows
+            public string CtrlCAction { get; set; } = "cancel"; // cancel | exit
+            public bool SaveHistory { get; set; } = false;
+            public string Theme { get; set; } = "gray"; // gray | green | cyan | white
+        }
 
         // ----------------------------------------------------------------
         //  Win32 P/Invoke
@@ -60,8 +79,11 @@ namespace Commando
             Console.OutputEncoding = Encoding.UTF8;
             Console.InputEncoding = Encoding.UTF8;
             Console.Title = "Windows Commando";
-            Console.ForegroundColor = ConsoleColor.Gray;
-            try { Console.BackgroundColor = ConsoleColor.Black; Console.Clear(); } catch { }
+            LoadSettings();
+            ApplyTheme();
+            Console.CancelKeyPress += HandleCancelKeyPress;
+            if (_settings.SaveHistory) LoadHistory();
+            try { Console.BackgroundColor = ConsoleColor.Black; if (_settings.ClearOnStart) Console.Clear(); } catch { }
 
             // Installation is explicit: starting the shell does not silently modify PATH or the registry.
 
@@ -72,18 +94,24 @@ namespace Commando
                 return 0;
             }
 
-            RenderStartupScreen();
+            if (_settings.ShowBanner) RenderStartupScreen();
 
-            // Minimal command line: no product name and no working-directory path.
+            // Ctrl+C cancels the current input/child command; it does not terminate the shell by default.
             while (true)
             {
-                Console.ForegroundColor = ConsoleColor.Gray;
-                Console.Write("> ");
+                ApplyTheme();
+                Console.Write(_settings.Prompt);
 
-                string? line = Console.ReadLine();
-                if (line == null) break;
+                string? line;
+                try { line = Console.ReadLine(); }
+                catch (IOException) { if (_ctrlCPressed) { _ctrlCPressed = false; continue; } throw; }
+                if (line == null)
+                {
+                    if (_ctrlCPressed) { _ctrlCPressed = false; continue; }
+                    break;
+                }
                 line = line.Trim();
-                if (line.Length == 0) continue;
+                if (line.Length == 0) { _ctrlCPressed = false; continue; }
 
                 if (string.Equals(line, "exit", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(line, "quit", StringComparison.OrdinalIgnoreCase))
@@ -92,17 +120,165 @@ namespace Commando
                 _history.Add(line);
                 try { Execute(line); }
                 catch (Exception ex) { Console.WriteLine($"Error: {ex.Message}"); }
+                finally { _ctrlCPressed = false; }
             }
+            if (_settings.SaveHistory) SaveHistory();
+            Console.CancelKeyPress -= HandleCancelKeyPress;
             return 0;
         }
 
         // ================================================================
         //  STARTUP HEADER
         // ================================================================
+        private static void HandleCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
+        {
+            if (string.Equals(_settings.CtrlCAction, "exit", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            e.Cancel = true;
+            _ctrlCPressed = true;
+            var child = _activeChild;
+            if (child != null)
+            {
+                try { if (!child.HasExited) child.Kill(entireProcessTree: true); } catch { }
+            }
+        }
+
+        private static void RunChildProcess(ProcessStartInfo psi)
+        {
+            using var process = Process.Start(psi);
+            if (process == null) { Console.WriteLine("Could not start process."); return; }
+            _activeChild = process;
+            try { process.WaitForExit(); }
+            finally { _activeChild = null; }
+        }
+
+        private static void ApplyTheme()
+        {
+            Console.ForegroundColor = (_settings.Theme ?? "gray").ToLowerInvariant() switch
+            {
+                "green" => ConsoleColor.Green,
+                "cyan" => ConsoleColor.Cyan,
+                "white" => ConsoleColor.White,
+                _ => ConsoleColor.Gray
+            };
+        }
+
+        private static void LoadSettings()
+        {
+            try
+            {
+                Directory.CreateDirectory(SettingsDirectory);
+                if (File.Exists(SettingsFile))
+                    _settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsFile)) ?? new AppSettings();
+            }
+            catch (Exception ex) { Console.WriteLine($"Settings could not be loaded; defaults used: {ex.Message}"); _settings = new AppSettings(); }
+            NormalizeSettings();
+        }
+
+        private static void SaveSettings()
+        {
+            Directory.CreateDirectory(SettingsDirectory);
+            File.WriteAllText(SettingsFile, JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
+            Console.WriteLine($"Settings saved: {SettingsFile}");
+        }
+
+        private static void NormalizeSettings()
+        {
+            _settings.Prompt ??= "> ";
+            _settings.DefaultShell ??= "cmd";
+            _settings.PowerShellHost ??= "auto";
+            _settings.CtrlCAction ??= "cancel";
+            _settings.Theme ??= "gray";
+            if (string.IsNullOrWhiteSpace(_settings.Prompt)) _settings.Prompt = "> ";
+            if (!_settings.DefaultShell.Equals("powershell", StringComparison.OrdinalIgnoreCase)) _settings.DefaultShell = "cmd";
+            if (!_settings.PowerShellHost.Equals("pwsh", StringComparison.OrdinalIgnoreCase) && !_settings.PowerShellHost.Equals("windows", StringComparison.OrdinalIgnoreCase)) _settings.PowerShellHost = "auto";
+            if (!_settings.CtrlCAction.Equals("exit", StringComparison.OrdinalIgnoreCase)) _settings.CtrlCAction = "cancel";
+            if (!_settings.Theme.Equals("green", StringComparison.OrdinalIgnoreCase) && !_settings.Theme.Equals("cyan", StringComparison.OrdinalIgnoreCase) && !_settings.Theme.Equals("white", StringComparison.OrdinalIgnoreCase)) _settings.Theme = "gray";
+        }
+
+        private static void LoadHistory()
+        {
+            try { if (File.Exists(HistoryFile)) _history.AddRange(File.ReadAllLines(HistoryFile).TakeLast(5000)); } catch { }
+        }
+
+        private static void SaveHistory()
+        {
+            try { Directory.CreateDirectory(SettingsDirectory); File.WriteAllLines(HistoryFile, _history.TakeLast(5000)); } catch (Exception ex) { Console.WriteLine($"History save failed: {ex.Message}"); }
+        }
+
+        private static void CmdConfig(string argument)
+        {
+            string[] a = SplitArgs(argument);
+            if (a.Length >= 3 && a[0].Equals("set", StringComparison.OrdinalIgnoreCase))
+            {
+                string key = a[1].ToLowerInvariant();
+                string value = argument[(argument.IndexOf(a[1], StringComparison.OrdinalIgnoreCase) + a[1].Length)..].Trim();
+                if (value.Length >= 2 && value[0] == '"' && value[^1] == '"') value = value[1..^1];
+                SetConfigValue(key, value);
+                return;
+            }
+            if (a.Length >= 1 && a[0].Equals("show", StringComparison.OrdinalIgnoreCase)) { ShowConfig(); return; }
+            if (a.Length >= 1 && a[0].Equals("reset", StringComparison.OrdinalIgnoreCase))
+            { _settings = new AppSettings(); SaveSettings(); ApplyTheme(); Console.WriteLine("Settings reset to defaults."); return; }
+
+            while (true)
+            {
+                Console.WriteLine("\nCOMMANDO SETTINGS");
+                ShowConfig();
+                Console.WriteLine("\n1 Prompt  2 Startup banner  3 Clear screen on start  4 Default shell");
+                Console.WriteLine("5 PowerShell host  6 Ctrl+C behavior  7 Save history  8 Theme");
+                Console.WriteLine("S Save    R Reset    Q Back");
+                Console.Write("Setting> ");
+                string? choice = Console.ReadLine();
+                if (choice == null || choice.Equals("q", StringComparison.OrdinalIgnoreCase)) break;
+                if (choice.Equals("s", StringComparison.OrdinalIgnoreCase)) { SaveSettings(); continue; }
+                if (choice.Equals("r", StringComparison.OrdinalIgnoreCase)) { _settings = new AppSettings(); ApplyTheme(); continue; }
+                Console.Write("Value> ");
+                string? value = Console.ReadLine(); if (value == null) break;
+                string key = choice.Trim() switch { "1" => "prompt", "2" => "banner", "3" => "clear", "4" => "shell", "5" => "powershell", "6" => "ctrlc", "7" => "history", "8" => "theme", _ => "" };
+                if (key.Length == 0) { Console.WriteLine("Unknown setting."); continue; }
+                SetConfigValue(key, value);
+            }
+        }
+
+        private static void ShowConfig()
+        {
+            Console.WriteLine($"Prompt          = {_settings.Prompt}");
+            Console.WriteLine($"Banner          = {_settings.ShowBanner}");
+            Console.WriteLine($"ClearOnStart    = {_settings.ClearOnStart}");
+            Console.WriteLine($"DefaultShell    = {_settings.DefaultShell}");
+            Console.WriteLine($"PowerShellHost  = {_settings.PowerShellHost}");
+            Console.WriteLine($"CtrlCAction     = {_settings.CtrlCAction}");
+            Console.WriteLine($"SaveHistory     = {_settings.SaveHistory}");
+            Console.WriteLine($"Theme           = {_settings.Theme}");
+            Console.WriteLine($"Config file     = {SettingsFile}");
+        }
+
+        private static void SetConfigValue(string key, string value)
+        {
+            value = value.Trim();
+            bool BoolValue() => value.Equals("on", StringComparison.OrdinalIgnoreCase) || value.Equals("true", StringComparison.OrdinalIgnoreCase) || value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+            switch (key)
+            {
+                case "prompt": _settings.Prompt = value; break;
+                case "banner": _settings.ShowBanner = BoolValue(); break;
+                case "clear": _settings.ClearOnStart = BoolValue(); break;
+                case "shell": if (value.Equals("cmd", StringComparison.OrdinalIgnoreCase) || value.Equals("powershell", StringComparison.OrdinalIgnoreCase)) _settings.DefaultShell = value.ToLowerInvariant(); else { Console.WriteLine("Use cmd or powershell."); return; } break;
+                case "powershell": if (new[] { "auto", "pwsh", "windows" }.Contains(value.ToLowerInvariant())) _settings.PowerShellHost = value.ToLowerInvariant(); else { Console.WriteLine("Use auto, pwsh or windows."); return; } break;
+                case "ctrlc": if (new[] { "cancel", "exit" }.Contains(value.ToLowerInvariant())) _settings.CtrlCAction = value.ToLowerInvariant(); else { Console.WriteLine("Use cancel or exit."); return; } break;
+                case "history": _settings.SaveHistory = BoolValue(); break;
+                case "theme": if (new[] { "gray", "green", "cyan", "white" }.Contains(value.ToLowerInvariant())) _settings.Theme = value.ToLowerInvariant(); else { Console.WriteLine("Use gray, green, cyan or white."); return; } break;
+                default: Console.WriteLine("Unknown setting. Use config show."); return;
+            }
+            ApplyTheme();
+            Console.WriteLine($"{key} updated. Use 'config' then S, or 'config save', to persist.");
+        }
+
         private static void RenderStartupScreen()
         {
-            Console.Clear();
-            Console.ForegroundColor = ConsoleColor.Gray;
+            if (_settings.ClearOnStart) { try { Console.Clear(); } catch { } }
+            ApplyTheme();
             Console.WriteLine("Windows Commando 2.3.1.1");
             Console.WriteLine("Type help for a list of commands.");
             Console.WriteLine();
@@ -131,6 +307,7 @@ namespace Commando
             switch (cmd)
             {
                 case "help":        CmdHelp();                              return;
+                case "config":     if (restLine.Equals("save", StringComparison.OrdinalIgnoreCase)) SaveSettings(); else CmdConfig(restLine); return;
                 case "cd":          CmdCd(restLine);                        return;
                 case "pushd":       CmdPushd(restLine);                      return;
                 case "popd":        CmdPopd();                               return;
@@ -193,7 +370,8 @@ namespace Commando
                 case "powershell":  CmdPowerShell(restLine);                 return;
                 case "ps1":         CmdPowerShellFile(rest);                 return;
                 default:
-                    RunInCmd(line);
+                    if (_settings.DefaultShell.Equals("powershell", StringComparison.OrdinalIgnoreCase)) CmdPowerShell(line);
+                    else RunInCmd(line);
                     return;
             }
         }
@@ -228,8 +406,7 @@ namespace Commando
                 WorkingDirectory = _currentDir,
                 UseShellExecute = false,
             };
-            using var proc = Process.Start(psi);
-            proc?.WaitForExit();
+            RunChildProcess(psi);
         }
 
         // ================================================================
@@ -238,14 +415,20 @@ namespace Commando
         private static string FindPowerShell()
         {
             // Prefer PowerShell 7 (pwsh); fall back to Windows PowerShell 5.1.
-            foreach (string candidate in new[] { "pwsh.exe", "powershell.exe" })
+            string[] candidates = _settings.PowerShellHost switch
+            {
+                "pwsh" => new[] { "pwsh.exe" },
+                "windows" => new[] { "powershell.exe" },
+                _ => new[] { "pwsh.exe", "powershell.exe" }
+            };
+            foreach (string candidate in candidates)
             {
                 try
                 {
                     var probe = new ProcessStartInfo
                     {
                         FileName = candidate,
-                        Arguments = "-NoLogo -NoProfile -Command \\"exit 0\\"",
+                        Arguments = "-NoLogo -NoProfile -Command \"exit 0\"",
                         UseShellExecute = false,
                         CreateNoWindow = true
                     };
@@ -281,14 +464,15 @@ namespace Commando
                 };
                 psi.ArgumentList.Add("-NoLogo");
                 psi.ArgumentList.Add("-NoProfile");
-                psi.ArgumentList.Add("-Command");
-                psi.ArgumentList.Add(command);
+                // EncodedCommand avoids Windows command-line quoting/escaping corruption.
+                psi.ArgumentList.Add("-EncodedCommand");
+                psi.ArgumentList.Add(Convert.ToBase64String(Encoding.Unicode.GetBytes(command)));
 
                 using var process = Process.Start(psi);
                 if (process == null) { Console.WriteLine("Could not start PowerShell."); return; }
-                process.WaitForExit();
-                if (process.ExitCode != 0)
-                    Console.WriteLine($"PowerShell exited with code {process.ExitCode}.");
+                _activeChild = process;
+                try { process.WaitForExit(); if (process.ExitCode != 0) Console.WriteLine($"PowerShell exited with code {process.ExitCode}."); }
+                finally { _activeChild = null; }
             }
             catch (Exception ex) { Console.WriteLine($"PowerShell error: {ex.Message}"); }
         }
@@ -298,7 +482,7 @@ namespace Commando
             if (args.Length == 0)
             {
                 Console.WriteLine("Usage: ps1 <script.ps1> [script arguments...]");
-                Console.WriteLine("Example: ps1 \\"scripts\\backup.ps1\\" -Destination \\"D:\\Backups\\"");
+                Console.WriteLine("Example: ps1 \"scripts\\backup.ps1\" -Destination \"D:\\Backups\"");
                 return;
             }
 
@@ -330,9 +514,9 @@ namespace Commando
 
                 using var process = Process.Start(psi);
                 if (process == null) { Console.WriteLine("Could not start PowerShell."); return; }
-                process.WaitForExit();
-                if (process.ExitCode != 0)
-                    Console.WriteLine($"PowerShell script exited with code {process.ExitCode}.");
+                _activeChild = process;
+                try { process.WaitForExit(); if (process.ExitCode != 0) Console.WriteLine($"PowerShell script exited with code {process.ExitCode}."); }
+                finally { _activeChild = null; }
             }
             catch (Exception ex) { Console.WriteLine($"PowerShell error: {ex.Message}"); }
         }
@@ -502,8 +686,15 @@ POWERSHELL
   psh <command>                   Run a PowerShell command
   powershell <command>            Alias for psh
   ps1 <script.ps1> [arguments]    Run a PowerShell script file
-  (Uses pwsh when installed, otherwise Windows PowerShell.
+  (Uses configured host; command text is passed using EncodedCommand.
    Execution policy is not bypassed automatically.)
+
+CONFIGURATION
+  config                           Open interactive Commando settings
+  config show                      Show current settings
+  config set <key> <value>         Change a setting
+  config save                      Save settings to settings.json
+  config reset                     Restore defaults
 
 OTHER
   clip get / clip set <text>       Clipboard operations
@@ -515,7 +706,7 @@ OTHER
   json <file>                      Format JSON file
   exit                             Exit shell
 
-Unknown commands are passed to cmd.exe. PowerShell: psh or ps1.
+Unknown commands use the configured default shell (cmd or PowerShell). Use psh for explicit PowerShell.
 ");
         }
 
